@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Zuno VR</title>
+<style>
+  body{margin:0;background:#000;overflow:hidden;font-family:sans-serif}
+  #lobby{position:fixed;top:10px;left:10px;color:#ccc;background:rgba(0,0,0,.7);
+         padding:12px;border-radius:8px;max-width:280px;z-index:5}
+  #lobby h2{margin:0 0 8px;color:#33ff66}
+  #lobby button,#lobby input{font-size:16px;padding:8px;margin:3px 2px}
+  #code{width:90px;text-transform:uppercase}
+  #status{margin-top:8px;font-size:14px;color:#9fd}
+</style>
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script type="importmap">
+{"imports":{
+  "three":"https://unpkg.com/three@0.160.0/build/three.module.js",
+  "three/addons/":"https://unpkg.com/three@0.160.0/examples/jsm/"
+}}
+</script>
+</head>
+<body>
+<div id="lobby">
+  <h2>ZUNO VR</h2>
+  <div id="buttons">
+    <button id="host">Host game</button><br>
+    <input id="code" placeholder="CODE" maxlength="4">
+    <button id="join">Join</button><br>
+    <button id="solo">Play solo</button>
+  </div>
+  <div id="status">Pick an option, then press ENTER VR.</div>
+</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { VRButton } from 'three/addons/webxr/VRButton.js';
+
+// =====================================================
+//  NETWORK STATE
+// =====================================================
+const net = { mode: 'solo', peer: null, conns: {}, hostConn: null, myId: 'me', code: '' };
+const scores = { me: { coins: 0, caught: 0 } };   // id -> {coins, caught}
+const remote = {};                                 // id -> avatar
+const $ = id => document.getElementById(id);
+const setStatus = t => { $('status').textContent = t; };
+const lock = () => { $('buttons').style.display = 'none'; };
+
+// =====================================================
+//  THREE.JS SETUP
+// =====================================================
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x050508);
+scene.fog = new THREE.Fog(0x050508, 2, 18);
+
+const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.05, 60);
+const rig = new THREE.Group();
+rig.add(camera);
+scene.add(rig);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.xr.enabled = true;
+document.body.appendChild(renderer.domElement);
+document.body.appendChild(VRButton.createButton(renderer));
+scene.add(new THREE.AmbientLight(0x404050, 0.6));
+
+// ---------- level ----------
+const solids = [];
+function box(cx, cy, cz, sx, sy, sz, color = 0x444450) {
+  const m = new THREE.Mesh(
+    new THREE.BoxGeometry(sx, sy, sz),
+    new THREE.MeshStandardMaterial({ color, roughness: 0.9 })
+  );
+  m.position.set(cx, cy, cz);
+  scene.add(m);
+  solids.push(new THREE.Box3().setFromObject(m));
+}
+box(0, -0.5, 0, 40, 1, 40, 0x222228);
+box(0, 2, -10, 20, 4, 0.5); box(0, 2, 10, 20, 4, 0.5);
+box(-10, 2, 0, 0.5, 4, 20); box(10, 2, 0, 0.5, 4, 20);
+box(-4, 0.75, -4, 2, 1.5, 2, 0x553333);
+box(3, 1, -5, 2, 2, 2, 0x335533);
+box(5, 0.5, 3, 3, 1, 2, 0x333355);
+box(-5, 1, 4, 2, 2, 2, 0x555533);
+box(0, 1.5, -7, 4, 0.3, 1, 0x444444);
+box(-7, 0.4, -1, 1.5, 0.8, 1.5, 0x553355);
+
+// ---------- terminal HUD ----------
+const hud = document.createElement('canvas');
+hud.width = 512; hud.height = 320;
+const hctx = hud.getContext('2d');
+const hudTex = new THREE.CanvasTexture(hud);
+const screen = new THREE.Mesh(
+  new THREE.PlaneGeometry(1.2, 0.75),
+  new THREE.MeshBasicMaterial({ map: hudTex })
+);
+screen.position.set(0, 1.5, -2.5);
+scene.add(screen);
+
+let msg = 'FIND THE COINS';
+function drawHud() {
+  const me = scores[net.myId] || { coins: 0, caught: 0 };
+  hctx.fillStyle = '#021a02'; hctx.fillRect(0, 0, 512, 320);
+  hctx.fillStyle = '#33ff66';
+  hctx.font = '34px monospace';
+  hctx.fillText('ZUNO VR', 20, 45);
+  hctx.font = '24px monospace';
+  const room = net.mode === 'solo' ? 'SOLO' : 'ROOM ' + net.code;
+  hctx.fillText(room + '  PLAYERS ' + (Object.keys(remote).length + 1), 20, 85);
+  hctx.fillText('COINS : ' + me.coins + '   CAUGHT: ' + me.caught, 20, 125);
+  const top = Object.entries(scores).sort((a, b) => b[1].coins - a[1].coins).slice(0, 3);
+  top.forEach(([id, s], i) => {
+    const name = id === net.myId ? 'YOU' : id.slice(-4).toUpperCase();
+    hctx.fillText('#' + (i + 1) + ' ' + name + ' ' + s.coins, 20, 170 + i * 32);
+  });
+  hctx.fillText(msg, 20, 295);
+  hudTex.needsUpdate = true;
+}
+
+// ---------- coins (host owns the truth) ----------
+const coinSpots = [[-4,2,-4],[3,2.6,-5],[5,1.6,3],[-5,2.6,4],[0,2.3,-7],
+                   [-7,1.4,-1],[0,0.5,5],[7,0.5,-6],[-8,0.5,8],[8,0.5,8]];
+const coinMeshes = [];
+const coinAlive = coinSpots.map(() => 1);
+for (const p of coinSpots) {
+  const c = new THREE.Mesh(
+    new THREE.OctahedronGeometry(0.12),
+    new THREE.MeshStandardMaterial({ color: 0xffcc00, emissive: 0xaa8800 })
+  );
+  c.position.set(...p);
+  scene.add(c);
+  coinMeshes.push(c);
+}
+
+// ---------- monster ----------
+const monster = new THREE.Group();
+const mbody = new THREE.Mesh(
+  new THREE.BoxGeometry(0.9, 1.8, 0.9),
+  new THREE.MeshStandardMaterial({ color: 0x330000 })
+);
+mbody.position.y = 0.9;
+monster.add(mbody);
+for (const x of [-0.2, 0.2]) {
+  const eye = new THREE.Mesh(
+    new THREE.SphereGeometry(0.07),
+    new THREE.MeshBasicMaterial({ color: 0xff0000 })
+  );
+  eye.position.set(x, 1.5, 0.46);
+  monster.add(eye);
+}
+monster.add(new THREE.PointLight(0xff0000, 1, 5).translateY(1.5));
+monster.position.set(8, 0, -8);
+scene.add(monster);
+const monsterTarget = { x: 8, z: -8, ry: 0 };   // used by clients for smoothing
+
+// ---------- my controllers + flashlight ----------
+const hands = [];
+for (let i = 0; i < 2; i++) {
+  const c = renderer.xr.getController(i);
+  c.add(new THREE.Mesh(
+    new THREE.SphereGeometry(0.06),
+    new THREE.MeshStandardMaterial({ color: 0x888888 })
+  ));
+  rig.add(c);
+  hands.push({ obj: c, prev: new THREE.Vector3(), touching: false });
+}
+const flash = new THREE.SpotLight(0xffffee, 2.5, 14, 0.45, 0.4);
+flash.target.position.set(0, 0, -1);
+hands[1].obj.add(flash, flash.target);
+
+// =====================================================
+//  OTHER PLAYERS (avatars)
+// =====================================================
+function makeAvatar(id) {
+  let h = 0; for (const ch of id) h = (h * 31 + ch.charCodeAt(0)) % 360;
+  const color = new THREE.Color().setHSL(h / 360, 0.7, 0.5);
+  const mat = new THREE.MeshStandardMaterial({ color });
+  const head = new THREE.Mesh(new THREE.BoxGeometry(0.28, 0.28, 0.28), mat);
+  const l = new THREE.Mesh(new THREE.SphereGeometry(0.07), mat);
+  const r = new THREE.Mesh(new THREE.SphereGeometry(0.07), mat);
+  scene.add(head, l, r);
+  return {
+    head, l, r,
+    tH: new THREE.Vector3(0, 1, 0), tL: new THREE.Vector3(), tR: new THREE.Vector3(),
+    v: 0
+  };
+}
+function ensureAvatar(id) {
+  if (!remote[id]) remote[id] = makeAvatar(id);
+  if (!scores[id]) scores[id] = { coins: 0, caught: 0 };
+  return remote[id];
+}
+function removeAvatar(id) {
+  const a = remote[id];
+  if (a) { scene.remove(a.head, a.l, a.r); delete remote[id]; }
+  delete scores[id];
+}
+function setAvatarState(id, s) {
+  const a = ensureAvatar(id);
+  a.tH.fromArray(s.h); a.tL.fromArray(s.l); a.tR.fromArray(s.r);
+  a.v = s.v || 0;
+}
+const r2 = n => Math.round(n * 100) / 100;
+const arr = v => [r2(v.x), r2(v.y), r2(v.z)];
+
+// =====================================================
+//  NETWORKING (PeerJS, host is the authority)
+// =====================================================
+function randomCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+  let s = ''; for (let i = 0; i < 4; i++) s += chars[Math.floor(Math.random() * chars.length)];
+  return s;
+}
+
+function startSolo() {
+  net.mode = 'solo'; net.myId = 'me';
+  scores.me = scores.me || { coins: 0, caught: 0 };
+  lock(); setStatus('Solo mode. Press ENTER VR.');
+}
+
+function startHost() {
+  const code = randomCode();
+  const peer = new Peer('zunovr-' + code);
+  setStatus('Creating room...');
+  peer.on('open', id => {
+    delete scores[net.myId];
+    net.peer = peer; net.mode = 'host'; net.myId = id; net.code = code;
+    scores[id] = { coins: 0, caught: 0 };
+    lock(); setStatus('Room code: ' + code + '. Tell your friends, then press ENTER VR.');
+  });
+  peer.on('connection', conn => {
+    conn.on('open', () => {
+      net.conns[conn.peer] = conn;
+      ensureAvatar(conn.peer);
+      msg = 'A PLAYER JOINED';
+    });
+    conn.on('data', d => onHostData(conn.peer, d));
+    conn.on('close', () => dropPlayer(conn.peer));
+    conn.on('error', () => dropPlayer(conn.peer));
+  });
+  peer.on('error', e => {
+    if (e.type === 'unavailable-id') { peer.destroy(); startHost(); }
+    else setStatus('Network error: ' + e.type);
+  });
+}
+
+function dropPlayer(id) {
+  delete net.conns[id];
+  removeAvatar(id);
+  msg = 'A PLAYER LEFT';
+}
+
+function startJoin(code) {
+  code = code.trim().toUpperCase();
+  if (code.length !== 4) { setStatus('Enter the 4-letter code.'); return; }
+  setStatus('Connecting...');
+  const peer = new Peer();
+  peer.on('open', id => {
+    delete scores[net.myId];
+    net.peer = peer; net.myId = id; net.code = code;
+    scores[id] = { coins: 0, caught: 0 };
+    const conn = peer.connect('zunovr-' + code, { reliable: true });
+    conn.on('open', () => {
+      net.hostConn = conn; net.mode = 'client';
+      lock(); setStatus('Joined room ' + code + '. Press ENTER VR.');
+    });
+    conn.on('data', onClientData);
+    conn.on('close', () => { net.hostConn = null; msg = 'HOST LEFT'; setStatus('Host left the game.'); });
+    conn.on('error', () => setStatus('Connection error.'));
+  });
+  peer.on('error', e => {
+    if (e.type === 'peer-unavailable') setStatus('Room not found. Check the code.');
+    else setStatus('Network error: ' + e.type);
+  });
+}
+
+// ----- host receives from clients -----
+function onHostData(id, d) {
+  if (d.t === 's') {                       // player state
+    setAvatarState(id, d);
+  } else if (d.t === 'c') {                // coin pickup request
+    collectCoin(d.i, id);
+  }
+}
+
+// ----- client receives from host -----
+function onClientData(d) {
+  if (d.t === 'w') {                       // world snapshot
+    const seen = {};
+    for (const id in d.p) {
+      if (id === net.myId) continue;
+      seen[id] = true;
+      setAvatarState(id, d.p[id]);
+    }
+    for (const id of Object.keys(remote)) if (!seen[id]) removeAvatar(id);
+    monsterTarget.x = d.m[0]; monsterTarget.z = d.m[1]; monsterTarget.ry = d.m[2];
+    for (let i = 0; i < coinAlive.length; i++) coinAlive[i] = d.c[i];
+    for (const id in d.s) scores[id] = d.s[id];
+    for (const id of Object.keys(scores)) if (!(id in d.s)) delete scores[id];
+  } else if (d.t === 'x') {                // you were caught
+    respawnSelf(); msg = 'CAUGHT! RUN!';
+  }
+}
+
+// ----- shared game rules (host side) -----
+function collectCoin(i, id) {
+  if (!coinAlive[i]) return;
+  coinAlive[i] = 0;
+  if (!scores[id]) scores[id] = { coins: 0, caught: 0 };
+  scores[id].coins++;
+  if (!coinAlive.some(a => a)) {
+    coinAlive.fill(1);
+    msg = 'ALL COINS! NEW ROUND';
+  }
+}
+
+function caughtPlayer(id) {
+  if (!scores[id]) return;
+  scores[id].caught++;
+  scores[id].coins = Math.max(0, scores[id].coins - 2);
+  monster.position.set(8, 0, -8);
+  if (id === net.myId) { respawnSelf(); msg = 'CAUGHT! RUN!'; }
+  else if (net.conns[id]) net.conns[id].send({ t: 'x' });
+}
+
+// =====================================================
+//  MOVEMENT (gorilla-style)
+// =====================================================
+const HAND_R = 0.08, MAX_SPEED = 7, BOOST = 1.25, G = 9.8;
+const vel = new THREE.Vector3();
+const tmp = new THREE.Vector3(), q = new THREE.Vector3();
+
+function handTouches(worldPos) {
+  for (const b of solids) {
+    q.copy(worldPos).clamp(b.min, b.max);
+    if (q.distanceTo(worldPos) < HAND_R) return true;
+  }
+  return false;
+}
+function respawnSelf() {
+  rig.position.set((Math.random() - 0.5) * 4, 0, (Math.random() - 0.5) * 4);
+  vel.set(0, 0, 0);
+}
+
+// =====================================================
+//  MAIN LOOP
+// =====================================================
+let last = performance.now(), sendT = 0, hudT = 0;
+const head = new THREE.Vector3();
+
+renderer.setAnimationLoop(() => {
+  const now = performance.now();
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+  if (dt <= 0) return;
+
+  // ----- my movement -----
+  const push = new THREE.Vector3();
+  let touching = false;
+  for (const h of hands) {
+    tmp.copy(h.obj.position).add(rig.position);
+    const hit = handTouches(tmp);
+    if (hit && h.touching) {
+      push.add(h.prev.clone().sub(h.obj.position));
+      touching = true;
+    }
+    h.touching = hit;
+    h.prev.copy(h.obj.position);
+  }
+  if (touching) {
+    rig.position.add(push);
+    vel.copy(push).divideScalar(dt).multiplyScalar(BOOST);
+    if (vel.length() > MAX_SPEED) vel.setLength(MAX_SPEED);
+  } else {
+    vel.y -= G * dt;
+    vel.x *= 0.995; vel.z *= 0.995;
+    rig.position.addScaledVector(vel, dt);
+  }
+  if (rig.position.y < 0) { rig.position.y = 0; if (vel.y < 0) vel.y = 0; }
+  rig.position.x = THREE.MathUtils.clamp(rig.position.x, -9.4, 9.4);
+  rig.position.z = THREE.MathUtils.clamp(rig.position.z, -9.4, 9.4);
+  camera.getWorldPosition(head);
+
+  // ----- host / solo: run the monster -----
+  if (net.mode !== 'client') {
+    const targets = [{ id: net.myId, pos: head.clone(), v: vel.length() }];
+    for (const id in remote) targets.push({ id, pos: remote[id].tH, v: remote[id].v });
+    let best = null, bestD = Infinity;
+    for (const t of targets) {
+      const d = Math.hypot(t.pos.x - monster.position.x, t.pos.z - monster.position.z);
+      if (d < bestD) { bestD = d; best = t; }
+    }
+    if (best && bestD > 0.01) {
+      const speed = Math.min(1.0 + best.v * 0.35, 5);
+      const dx = (best.pos.x - monster.position.x) / bestD;
+      const dz = (best.pos.z - monster.position.z) / bestD;
+      monster.position.x += dx * speed * dt;
+      monster.position.z += dz * speed * dt;
+      monster.rotation.y = Math.atan2(dx, dz);
+    }
+    if (best && bestD < 0.7 && best.pos.y < 2.2) caughtPlayer(best.id);
+  } else {
+    // client: smooth toward the host's monster position
+    monster.position.x += (monsterTarget.x - monster.position.x) * 0.3;
+    monster.position.z += (monsterTarget.z - monster.position.z) * 0.3;
+    monster.rotation.y = monsterTarget.ry;
+  }
+
+  // ----- coins -----
+  for (let i = 0; i < coinMeshes.length; i++) {
+    const c = coinMeshes[i];
+    c.visible = !!coinAlive[i];
+    if (!c.visible) continue;
+    c.rotation.y += dt * 2;
+    let near = c.position.distanceTo(head) < 0.4;
+    for (const h of hands) {
+      if (near) break;
+      tmp.copy(h.obj.position).add(rig.position);
+      near = c.position.distanceTo(tmp) < 0.25;
+    }
+    if (near) {
+      msg = 'COIN!';
+      if (net.mode === 'client') {
+        coinAlive[i] = 0;
+        if (net.hostConn) net.hostConn.send({ t: 'c', i });
+      } else {
+        collectCoin(i, net.myId);
+      }
+    }
+  }
+
+  // ----- other players: smooth their avatars -----
+  for (const id in remote) {
+    const a = remote[id];
+    a.head.position.lerp(a.tH, 0.3);
+    a.l.position.lerp(a.tL, 0.3);
+    a.r.position.lerp(a.tR, 0.3);
+  }
+
+  // ----- send network updates ~15 times per second -----
+  sendT += dt;
+  if (sendT > 0.066) {
+    sendT = 0;
+    const lw = hands[0].obj.position.clone().add(rig.position);
+    const rw = hands[1].obj.position.clone().add(rig.position);
+    const mine = { h: arr(head), l: arr(lw), r: arr(rw), v: r2(vel.length()) };
+    if (net.mode === 'client' && net.hostConn) {
+      net.hostConn.send({ t: 's', ...mine });
+    } else if (net.mode === 'host') {
+      const p = {}; p[net.myId] = mine;
+      for (const id in remote) {
+        const a = remote[id];
+        p[id] = { h: arr(a.tH), l: arr(a.tL), r: arr(a.tR), v: r2(a.v) };
+      }
+      const world = {
+        t: 'w', p,
+        m: [r2(monster.position.x), r2(monster.position.z), r2(monster.rotation.y)],
+        c: coinAlive, s: scores
+      };
+      for (const id in net.conns) net.conns[id].send(world);
+    }
+  }
+
+  // ----- refresh the terminal screen -----
+  hudT += dt;
+  if (hudT > 0.3) { hudT = 0; drawHud(); }
+
+  renderer.render(scene, camera);
+});
+
+// =====================================================
+//  LOBBY BUTTONS
+// =====================================================
+$('host').onclick = startHost;
+$('join').onclick = () => startJoin($('code').value);
+$('solo').onclick = startSolo;
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+drawHud();
+</script>
+</body>
+</html>
